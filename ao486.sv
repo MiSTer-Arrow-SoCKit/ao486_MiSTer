@@ -2,7 +2,7 @@
 //  ao486
 // 
 //  Port to MiSTer.
-//  Copyright (C) 2017,2018 Sorgelig
+//  Copyright (C) 2017-2019 Alexey Melnikov
 //
 //  This program is free software; you can redistribute it and/or modify it
 //  under the terms of the GNU General Public License as published by the Free
@@ -29,7 +29,7 @@ module emu
 	input         RESET,
 
 	//Must be passed to hps_io module
-	inout  [44:0] HPS_BUS,
+	inout  [45:0] HPS_BUS,
 
 	//Base video clock. Usually equals to CLK_SYS.
 	output        CLK_VIDEO,
@@ -59,13 +59,20 @@ module emu
 	output  [1:0] LED_POWER,
 	output  [1:0] LED_DISK,
 
+	// I/O board button press simulation (active high)
+	// b[1]: user button
+	// b[0]: osd button
+	output  [1:0] BUTTONS,
+
 	output [15:0] AUDIO_L,
 	output [15:0] AUDIO_R,
 	output        AUDIO_S, // 1 - signed audio samples, 0 - unsigned
 	output  [1:0] AUDIO_MIX, // 0 - no mix, 1 - 25%, 2 - 50%, 3 - 100% (mono)
-	input         TAPE_IN,
 
-	// SD-SPI
+	//ADC
+	inout   [3:0] ADC_BUS,
+
+	//SD-SPI
 	output        SD_SCK,
 	output        SD_MOSI,
 	input         SD_MISO,
@@ -108,20 +115,20 @@ module emu
 	// Open-drain User port.
 	// 0 - D+/RX
 	// 1 - D-/TX
-	// 2..5 - USR1..USR4
+	// 2..6 - USR2..USR6
 	// Set USER_OUT to 1 to read from USER_IN.
-	input   [5:0] USER_IN,
-	output  [5:0] USER_OUT,
+	input   [6:0] USER_IN,
+	output  [6:0] USER_OUT,
 
 	input         OSD_STATUS
 );
 
+assign ADC_BUS  = 'Z;
 assign USER_OUT = '1;
 assign {SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 6'b111111;
 assign SDRAM_DQ  ='Z;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
-assign CE_PIXEL  = 1;
 assign VIDEO_ARX = status[1] ? 8'd16 : 8'd4;
 assign VIDEO_ARY = status[1] ? 8'd9  : 8'd3;
 
@@ -132,6 +139,7 @@ assign AUDIO_R   = sb_out_r + {2'b00, {14{speaker_ena & speaker_out}}};
 
 assign LED_DISK[1] = 1;
 assign LED_POWER   = 0;
+assign BUTTONS   = 0;
 
 led hdd_led(clk_sys,  device & ioctl_wait, LED_DISK[0]);
 led fdd_led(clk_sys, ~device & ioctl_wait, LED_USER);
@@ -148,6 +156,7 @@ localparam CONF_STR =
 	"S3,VHD,Mount Secondary HDD;",
 	"-;",
 	"O1,Aspect ratio,4:3,16:9;",
+	"O4,VSync,60Hz,Variable;",
 	"O3,FM mode,OPL2,OPL3;",
 	"-;",
 	"OX2,Boot order,FDD/HDD,HDD/FDD;",
@@ -186,6 +195,8 @@ wire  [5:0] joystick_1;
 wire [15:0] joystick_analog_0;
 wire [15:0] joystick_analog_1;
 
+wire [21:0] gamma_bus;
+
 hps_io #(.STRLEN(($size(CONF_STR))>>3), .PS2DIV(4000)) hps_io
 (
 	.clk_sys(clk_sys),
@@ -205,6 +216,8 @@ hps_io #(.STRLEN(($size(CONF_STR))>>3), .PS2DIV(4000)) hps_io
 
 	.buttons(buttons),
 	.status(status),
+	.new_vmode(status[4]),
+	.gamma_bus(gamma_bus),
 
 	.ioctl_wait(ioctl_wait),
 	
@@ -248,13 +261,57 @@ wire        device;
 
 wire        de;
 reg  [15:0] ded;
-always @(posedge CLK_VIDEO) ded <= (ded<<1) | de;
-
-// ugly fix of right black border.
-assign VGA_DE = de & ded[15];
+always @(posedge CLK_VIDEO) if(CE_PIXEL) ded <= (ded<<1) | de;
 
 assign VGA_F1 = 0;
 assign VGA_SL = 0;
+assign CLK_VIDEO = clk_sys;
+
+wire [7:0] r,g,b;
+wire       HSync,VSync;
+
+video_cleaner video_cleaner
+(
+	.clk_vid(CLK_VIDEO),
+	.ce_pix(CE_PIXEL),
+
+	.R(r),
+	.G(g),
+	.B(b),
+
+	.HSync(HSync),
+	.VSync(VSync),
+	.DE_in(de & ded[15]),
+
+	.VGA_R(R),
+	.VGA_G(G),
+	.VGA_B(B),
+	.VGA_VS(vs),
+	.VGA_HS(hs),
+	.DE_out(de1)
+);
+
+wire hs,vs,de1;
+wire [7:0] R,G,B;
+
+gamma_fast gamma
+(
+	.clk_vid(CLK_VIDEO),
+	.ce_pix(CE_PIXEL),
+
+	.gamma_bus(gamma_bus),
+
+	.HSync(hs),
+	.VSync(vs),
+	.DE(de1),
+	.RGB_in({R,G,B}),
+
+	.HSync_out(VGA_HS),
+	.VSync_out(VGA_VS),
+	.DE_out(VGA_DE),
+	.RGB_out({VGA_R,VGA_G,VGA_B})
+);
+
 
 system u0
 (
@@ -263,13 +320,14 @@ system u0
 	.qsys_reset_reset     (sys_reset),
 	.pll_reset_reset      (0),
 
-	.vga_clock            (CLK_VIDEO),
+	.vga_ce               (CE_PIXEL),
+	.vga_mode             (status[4]),
 	.vga_blank_n          (de),
-	.vga_hsync            (VGA_HS),
-	.vga_vsync            (VGA_VS),
-	.vga_r                (VGA_R),
-	.vga_g                (VGA_G),
-	.vga_b                (VGA_B),
+	.vga_hsync            (HSync),
+	.vga_vsync            (VSync),
+	.vga_r                (r),
+	.vga_g                (g),
+	.vga_b                (b),
 
 	.sound_sample_l       (sb_out_l),
 	.sound_sample_r       (sb_out_r),
